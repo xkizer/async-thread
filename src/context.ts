@@ -10,11 +10,18 @@ export enum Actions {
     CREATE_FUNCTION,
     CREATE_FUNCTION_FAIL,
     CREATE_FUNCTION_SUCCEED,
+    CALL_FUNCTION,
+    CALL_FUNCTION_FAIL,
+    CALL_FUNCTION_SUCCEED,
 }
 
 export function createContext(): ThreadContext {
+    const contextId = generateContextId();
+
     let threads: WorkerThread[] | null = Array(CPU_COUNT).fill(0).map(() => {
-        return new WorkerThread();
+        const thread = new WorkerThread();
+        console.log(`Created thread "${thread.id}" for context "${contextId}"`);
+        return thread;
     });
 
     function ensureNotDestroyed() {
@@ -24,46 +31,79 @@ export function createContext(): ThreadContext {
     }
 
     return {
-        createThreadedFunction<A extends any[], R>(fn: (...args: A) => R): ThreadedFunction<A, R> {
+        async createThreadedFunction<A extends any[], R>(fn: (...args: A) => R): Promise<ThreadedFunction<A, R>> {
             // Create a unique identifier for this function
             ensureNotDestroyed();
-            const fnId = randomatic('Aa0', 32);
-            threads!.forEach((thread) => {
-                thread.postMessage({
-                    action: Actions.CREATE_FUNCTION,
-                    id: fnId,
-                    definition: fn.toString(),
-                });
+            const fnId = generateFunctionId();
+            const definition = fn.toString();
+            const defs: FunctionDefs = [];
+            let calls = 0;
+
+            const promises = threads!.map(async (thread) => {
+                try {
+                    await thread.createFunction(fnId, definition);
+                    defs.push(thread);
+                    console.log('Function created on thread', thread.id);
+                } catch (e) {
+                    console.error('Function creation failed on thread', thread.id);
+                }
             });
+
+            // Wait and ensure that at least one succeeded
+            await Promise.all(promises);
+            promises.length = 0;
+
+            if (defs.length === 0) {
+                console.error('Function creation failed on all threads');
+                throw new Error('Function creation failed');
+            }
+
+            const retFn = async function(...args: A): Promise<R> {
+                // choose next thread round-robin style
+                const callId = generateCallId();
+                const thread = defs[calls++ % defs.length];
+                return thread.callFunction<R>(fnId, callId, ...args);
+            };
+
+            retFn.length = fn.length;
+            retFn.name = fn.name;
+            return retFn;
         },
 
         async destroyContext() {
             ensureNotDestroyed();
-            const terminateAll = threads!.map((thread) => {
-                return new Promise((res, rej) => {
-                    thread.terminate((err: Error, exitCode: number) => {
-                        if (err) {
-                            rej(err);
-                        }
-
-                        res(exitCode);
-                    });
-                });
-            });
-
+            const terminateAll = threads!.map((thread) => thread.terminate());
             await Promise.all(terminateAll);
             threads = null;
         }
     };
 }
 
-function generateFunctionId(): CallId {
+type FunctionDefs = WorkerThread[];
+
+function generateFunctionId(): FunctionId {
     return randomatic('Aa0', 8);
 }
 
-interface CallId extends String {}
+function generateCallId(): CallId {
+    return randomatic('Aa0', 24);
+}
 
-interface FunctionId extends String {}
+function generateThreadId(): ThreadId {
+    return randomatic('Aa0', 4);
+}
+
+function generateContextId(): ContextId {
+    return randomatic('Aa0', 4);
+}
+
+export interface CallId extends String {}
+
+export interface FunctionId extends String {}
+
+export interface ThreadId extends String {}
+
+export interface ContextId extends String {}
 
 type FunctionCreateLog = Map<FunctionId, CallbackPair>;
 
@@ -81,9 +121,12 @@ class WorkerThread {
 
     private functionCreateLog: FunctionCreateLog = new Map();
 
+    readonly id: ThreadId;
+
     constructor() {
         this.worker = new Worker(WORKER_FILE);
         this.setupListeners();
+        this.id = generateThreadId();
     }
 
     private setupListeners() {
@@ -91,15 +134,23 @@ class WorkerThread {
         this.worker!.on('message', (message: ThreadMessage) => {
             switch(message.action) {
                 case Actions.CREATE_FUNCTION_FAIL:
-                    this.createFunctionFail(message.fnId, message.error);
+                    this.createFunctionFail(message.fnId, message.error!);
                     break;
                 case Actions.CREATE_FUNCTION_SUCCEED:
+                    this.createFunctionSucceed(message.fnId);
+                    break;
+                case Actions.CALL_FUNCTION_FAIL:
+                    this.callFunctionFail(message.callId, message.error!);
+                    break;
+                case Actions.CALL_FUNCTION_SUCCEED:
+                    this.callFunctionSucceed(message.callId, message.value);
+                    break;
             }
         });
     }
 
-    private createFunctionFail(functionId: CallId, error: string) {
-        const callbacks = this.callLog.get(functionId);
+    private createFunctionFail(functionId: FunctionId, error: string) { // TODO: figure out how the actual error can be transfered if possible to allow stack tracing
+        const callbacks = this.functionCreateLog.get(functionId);
 
         if (!callbacks) {
             // callback not found, log error and fail silently
@@ -107,12 +158,12 @@ class WorkerThread {
             return;
         }
 
-        this.callLog.delete(functionId);
-        callbacks.fail()
+        this.functionCreateLog.delete(functionId);
+        callbacks.fail(new Error(error));
     }
 
-    private createFunctionSucceed(functionId: CallId) {
-        const callbacks = this.callLog.get(functionId);
+    private createFunctionSucceed(functionId: FunctionId) {
+        const callbacks = this.functionCreateLog.get(functionId);
 
         if (!callbacks) {
             // callback not found, log error and fail silently
@@ -120,8 +171,32 @@ class WorkerThread {
             return;
         }
 
-        this.callLog.delete(functionId);
-        callbacks.fail()
+        this.functionCreateLog.delete(functionId);
+        callbacks.success(null);
+    }
+
+    private callFunctionFail(callId: CallId, error: string) { // TODO: figure out how the actual error can be transfered if possible to allow stack tracing
+        const callbacks = this.callLog.get(callId);
+
+        if (!callbacks) {
+            console.error('Function call failed, but callback not found');
+            return;
+        }
+
+        this.callLog.delete(callId);
+        callbacks.fail(new Error(error));
+    }
+
+    private callFunctionSucceed(callId: CallId, result: any) { // TODO: figure out how the actual error can be transfered if possible to allow stack tracing
+        const callbacks = this.callLog.get(callId);
+
+        if (!callbacks) {
+            console.error('Function call succeeded, but callback not found');
+            return;
+        }
+
+        this.callLog.delete(callId);
+        callbacks.success(result);
     }
 
     ensureNotDestroyed() {
@@ -130,18 +205,40 @@ class WorkerThread {
         }
     }
 
-    createFunction(fn: Function) {
-        const fnId = generateFunctionId();
+    terminate() {
+        this.ensureNotDestroyed();
+        this.worker!.terminate(() => {
+            this.worker = null;
+        });
+    }
 
+    createFunction(fnId: FunctionId, fn: string) {
         return new Promise((res, rej) => {
             this.ensureNotDestroyed();
             this.worker!.postMessage({
                 action: Actions.CREATE_FUNCTION,
-                id: fnId,
-                definition: fn.toString(),
+                fnId: fnId,
+                definition: fn,
             });
             
-            this.callLog.set(fnId, {
+            this.functionCreateLog.set(fnId, {
+                fail: rej,
+                success: res,
+            });
+        });
+    }
+
+    callFunction<R>(fnId: FunctionId, callId: CallId, ...args: unknown[]) {
+        return new Promise<R>((res, rej) => {
+            this.ensureNotDestroyed();
+            this.worker!.postMessage({
+                action: Actions.CALL_FUNCTION,
+                fnId,
+                callId,
+                args,
+            });
+
+            this.callLog.set(callId, {
                 fail: rej,
                 success: res,
             });
@@ -150,11 +247,16 @@ class WorkerThread {
 }
 
 export interface ThreadContext {
-    createThreadedFunction<A extends any[], R>(fn: (...args: A) => R): ThreadedFunction<A, R>;
+    createThreadedFunction<A extends any[], R>(fn: (...args: A) => R): Promise<ThreadedFunction<A, R>>;
     destroyContext(): Promise<void>;
 }
 
 export type ThreadMessage = {
     action: Actions;
-    [key: string]: any;
+    fnId: FunctionId;
+    callId: CallId;
+    definition?: string;
+    error?: string;
+    value?: unknown;
+    args?: unknown[];
 };
